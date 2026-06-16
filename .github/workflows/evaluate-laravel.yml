@@ -40,15 +40,39 @@ jobs:
           extensions: mbstring, dom, fileinfo, pdo_sqlite, sqlite3
           coverage: none
 
-      - name: Install Composer dependencies
-        run: composer install --no-interaction --prefer-dist --no-progress
-
-      - name: Prepare Laravel testing environment
+      - name: Run Laravel evaluation and always create result
+        id: evaluation
+        shell: bash
+        env:
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+          EXERCISE_SLUG: ${{ inputs.exercise_slug }}
+          TEST_SUITE: ${{ inputs.test_suite }}
+          STUDENT_BRANCH: ${{ inputs.student_branch }}
         run: |
-          mkdir -p database
-          touch database/database.sqlite
+          mkdir -p evaluation-results
 
-          cat > .env <<EOF
+          STATUS="failed"
+          SCORE=0
+          MESSAGE="Evaluation did not finish."
+
+          echo "Starting evaluation..." > evaluation-results/full-output.txt
+
+          set +e
+
+          if [ ! -f composer.json ]; then
+            MESSAGE="composer.json not found. The submitted branch does not look like a Laravel project."
+          else
+            echo ">>> Installing Composer dependencies" >> evaluation-results/full-output.txt
+            composer install --no-interaction --prefer-dist --no-progress >> evaluation-results/full-output.txt 2>&1
+            INSTALL_EXIT=$?
+
+            if [ "$INSTALL_EXIT" -ne 0 ]; then
+              MESSAGE="Composer install failed."
+            else
+              mkdir -p database
+              touch database/database.sqlite
+
+              cat > .env <<EOF
           APP_NAME=Laravel
           APP_ENV=testing
           APP_KEY=
@@ -64,16 +88,24 @@ jobs:
           MAIL_MAILER=array
           EOF
 
-          php artisan key:generate --force
-          php artisan config:clear
-          php artisan route:clear
-          php artisan migrate --force
+              echo ">>> Generating app key" >> evaluation-results/full-output.txt
+              php artisan key:generate --force >> evaluation-results/full-output.txt 2>&1
+              KEY_EXIT=$?
 
-      - name: Create hidden Posts CRUD test
-        run: |
-          mkdir -p tests/Feature/Hidden
+              echo ">>> Clearing config" >> evaluation-results/full-output.txt
+              php artisan config:clear >> evaluation-results/full-output.txt 2>&1
+              CONFIG_EXIT=$?
 
-          cat > tests/Feature/Hidden/PostsCrudHiddenTest.php <<'PHP'
+              echo ">>> Running migrations" >> evaluation-results/full-output.txt
+              php artisan migrate --force >> evaluation-results/full-output.txt 2>&1
+              MIGRATE_EXIT=$?
+
+              if [ "$KEY_EXIT" -ne 0 ] || [ "$CONFIG_EXIT" -ne 0 ] || [ "$MIGRATE_EXIT" -ne 0 ]; then
+                MESSAGE="Laravel setup or migrations failed."
+              else
+                mkdir -p tests/Feature/Hidden
+
+                cat > tests/Feature/Hidden/PostsCrudHiddenTest.php <<'PHP'
           <?php
 
           namespace Tests\Feature\Hidden;
@@ -166,63 +198,50 @@ jobs:
           }
           PHP
 
-      - name: Run hidden tests and create result
-        id: hidden_tests
-        env:
-          SUBMISSION_ID: ${{ inputs.submission_id }}
-          EXERCISE_SLUG: ${{ inputs.exercise_slug }}
-          TEST_SUITE: ${{ inputs.test_suite }}
-          STUDENT_BRANCH: ${{ inputs.student_branch }}
-        run: |
-          mkdir -p evaluation-results
+                echo ">>> Running hidden tests" >> evaluation-results/full-output.txt
+                php artisan test --filter=PostsCrudHiddenTest --colors=never >> evaluation-results/full-output.txt 2>&1
+                TEST_EXIT=$?
 
-          set +e
-          php artisan test --filter=PostsCrudHiddenTest --colors=never > evaluation-results/phpunit-output.txt 2>&1
-          TEST_EXIT=$?
-          set -e
+                if [ "$TEST_EXIT" -eq 0 ]; then
+                  STATUS="passed"
+                  SCORE=100
+                  MESSAGE="Hidden Laravel Posts CRUD tests passed."
+                else
+                  STATUS="failed"
+                  SCORE=0
+                  MESSAGE="Hidden Laravel Posts CRUD tests failed."
+                fi
+              fi
+            fi
+          fi
 
-          echo "test_exit=$TEST_EXIT" >> "$GITHUB_OUTPUT"
+          export EVAL_STATUS="$STATUS"
+          export EVAL_SCORE="$SCORE"
+          export EVAL_MESSAGE="$MESSAGE"
 
           python3 - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          output_path = Path("evaluation-results/phpunit-output.txt")
+          output_path = Path("evaluation-results/full-output.txt")
           output = output_path.read_text(errors="replace") if output_path.exists() else ""
 
-          test_exit = int(os.environ.get("TEST_EXIT", "0")) if os.environ.get("TEST_EXIT") else None
-          PY
-
-          if [ "$TEST_EXIT" -eq 0 ]; then
-            STATUS="passed"
-            SCORE=100
-            MESSAGE="Hidden Laravel Posts CRUD tests passed."
-          else
-            STATUS="failed"
-            SCORE=0
-            MESSAGE="Hidden Laravel Posts CRUD tests failed."
-          fi
-
-          python3 - <<PY
-          import json
-          from pathlib import Path
-
-          output = Path("evaluation-results/phpunit-output.txt").read_text(errors="replace")
-
           data = {
-              "submission_id": "${{ inputs.submission_id }}",
-              "exercise_slug": "${{ inputs.exercise_slug }}",
-              "test_suite": "${{ inputs.test_suite }}",
-              "student_branch": "${{ inputs.student_branch }}",
-              "status": "$STATUS",
-              "score": $SCORE,
-              "message": "$MESSAGE",
-              "phpunit_output": output[-12000:]
+              "submission_id": os.environ.get("SUBMISSION_ID"),
+              "exercise_slug": os.environ.get("EXERCISE_SLUG"),
+              "test_suite": os.environ.get("TEST_SUITE"),
+              "student_branch": os.environ.get("STUDENT_BRANCH"),
+              "status": os.environ.get("EVAL_STATUS", "failed"),
+              "score": int(os.environ.get("EVAL_SCORE", "0")),
+              "message": os.environ.get("EVAL_MESSAGE", "Evaluation failed."),
+              "output": output[-12000:]
           }
 
           Path("evaluation-results/result.json").write_text(json.dumps(data, indent=2))
           PY
+
+          echo "eval_status=$STATUS" >> "$GITHUB_OUTPUT"
 
       - name: Upload result artifact
         if: always()
@@ -231,8 +250,8 @@ jobs:
           name: evaluation-result-${{ inputs.submission_id }}
           path: |
             evaluation-results/result.json
-            evaluation-results/phpunit-output.txt
+            evaluation-results/full-output.txt
 
-      - name: Fail workflow when hidden tests fail
-        if: steps.hidden_tests.outputs.test_exit != '0'
+      - name: Fail workflow if evaluation failed
+        if: steps.evaluation.outputs.eval_status != 'passed'
         run: exit 1
