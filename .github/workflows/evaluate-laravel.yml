@@ -33,23 +33,206 @@ jobs:
         with:
           ref: ${{ inputs.student_branch }}
 
-      - name: Create result file
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, dom, fileinfo, pdo_sqlite, sqlite3
+          coverage: none
+
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Prepare Laravel testing environment
+        run: |
+          mkdir -p database
+          touch database/database.sqlite
+
+          cat > .env <<EOF
+          APP_NAME=Laravel
+          APP_ENV=testing
+          APP_KEY=
+          APP_DEBUG=true
+          APP_URL=http://localhost
+
+          DB_CONNECTION=sqlite
+          DB_DATABASE=${{ github.workspace }}/database/database.sqlite
+
+          CACHE_STORE=array
+          SESSION_DRIVER=array
+          QUEUE_CONNECTION=sync
+          MAIL_MAILER=array
+          EOF
+
+          php artisan key:generate --force
+          php artisan config:clear
+          php artisan route:clear
+          php artisan migrate --force
+
+      - name: Create hidden Posts CRUD test
+        run: |
+          mkdir -p tests/Feature/Hidden
+
+          cat > tests/Feature/Hidden/PostsCrudHiddenTest.php <<'PHP'
+          <?php
+
+          namespace Tests\Feature\Hidden;
+
+          use Illuminate\Foundation\Testing\RefreshDatabase;
+          use Illuminate\Support\Facades\DB;
+          use Illuminate\Support\Facades\Route;
+          use Illuminate\Support\Facades\Schema;
+          use Tests\TestCase;
+
+          class PostsCrudHiddenTest extends TestCase
+          {
+              use RefreshDatabase;
+
+              public function test_posts_table_and_resource_routes_exist(): void
+              {
+                  $this->assertTrue(Schema::hasTable('posts'), 'The posts table does not exist.');
+
+                  $expectedRoutes = [
+                      'posts.index',
+                      'posts.create',
+                      'posts.store',
+                      'posts.show',
+                      'posts.edit',
+                      'posts.update',
+                      'posts.destroy',
+                  ];
+
+                  foreach ($expectedRoutes as $routeName) {
+                      $this->assertTrue(
+                          Route::has($routeName),
+                          "Missing route name: {$routeName}. Use Route::resource('posts', PostController::class)."
+                      );
+                  }
+              }
+
+              public function test_post_validation_requires_title_and_content(): void
+              {
+                  $response = $this
+                      ->from('/posts/create')
+                      ->post('/posts', [
+                          'title' => '',
+                          'content' => '',
+                      ]);
+
+                  $response->assertSessionHasErrors(['title', 'content']);
+              }
+
+              public function test_post_can_be_created_updated_and_deleted(): void
+              {
+                  $createResponse = $this->post('/posts', [
+                      'title' => 'Hidden Test Title',
+                      'content' => 'Hidden test content.',
+                  ]);
+
+                  $this->assertContains($createResponse->getStatusCode(), [200, 201, 302]);
+
+                  $this->assertDatabaseHas('posts', [
+                      'title' => 'Hidden Test Title',
+                      'content' => 'Hidden test content.',
+                  ]);
+
+                  $postId = DB::table('posts')
+                      ->where('title', 'Hidden Test Title')
+                      ->value('id');
+
+                  $this->assertNotNull($postId, 'The created post id was not found.');
+
+                  $updateResponse = $this->put('/posts/'.$postId, [
+                      'title' => 'Updated Hidden Test Title',
+                      'content' => 'Updated hidden test content.',
+                  ]);
+
+                  $this->assertContains($updateResponse->getStatusCode(), [200, 201, 302]);
+
+                  $this->assertDatabaseHas('posts', [
+                      'id' => $postId,
+                      'title' => 'Updated Hidden Test Title',
+                      'content' => 'Updated hidden test content.',
+                  ]);
+
+                  $deleteResponse = $this->delete('/posts/'.$postId);
+
+                  $this->assertContains($deleteResponse->getStatusCode(), [200, 204, 302]);
+
+                  $this->assertDatabaseMissing('posts', [
+                      'id' => $postId,
+                  ]);
+              }
+          }
+          PHP
+
+      - name: Run hidden tests and create result
+        id: hidden_tests
+        env:
+          SUBMISSION_ID: ${{ inputs.submission_id }}
+          EXERCISE_SLUG: ${{ inputs.exercise_slug }}
+          TEST_SUITE: ${{ inputs.test_suite }}
+          STUDENT_BRANCH: ${{ inputs.student_branch }}
         run: |
           mkdir -p evaluation-results
 
-          cat > evaluation-results/result.json <<EOF
-          {
-            "submission_id": "${{ inputs.submission_id }}",
-            "exercise_slug": "${{ inputs.exercise_slug }}",
-            "test_suite": "${{ inputs.test_suite }}",
-            "student_branch": "${{ inputs.student_branch }}",
-            "status": "workflow_started",
-            "message": "GitHub Actions workflow triggered successfully."
+          set +e
+          php artisan test --filter=PostsCrudHiddenTest --colors=never > evaluation-results/phpunit-output.txt 2>&1
+          TEST_EXIT=$?
+          set -e
+
+          echo "test_exit=$TEST_EXIT" >> "$GITHUB_OUTPUT"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          output_path = Path("evaluation-results/phpunit-output.txt")
+          output = output_path.read_text(errors="replace") if output_path.exists() else ""
+
+          test_exit = int(os.environ.get("TEST_EXIT", "0")) if os.environ.get("TEST_EXIT") else None
+          PY
+
+          if [ "$TEST_EXIT" -eq 0 ]; then
+            STATUS="passed"
+            SCORE=100
+            MESSAGE="Hidden Laravel Posts CRUD tests passed."
+          else
+            STATUS="failed"
+            SCORE=0
+            MESSAGE="Hidden Laravel Posts CRUD tests failed."
+          fi
+
+          python3 - <<PY
+          import json
+          from pathlib import Path
+
+          output = Path("evaluation-results/phpunit-output.txt").read_text(errors="replace")
+
+          data = {
+              "submission_id": "${{ inputs.submission_id }}",
+              "exercise_slug": "${{ inputs.exercise_slug }}",
+              "test_suite": "${{ inputs.test_suite }}",
+              "student_branch": "${{ inputs.student_branch }}",
+              "status": "$STATUS",
+              "score": $SCORE,
+              "message": "$MESSAGE",
+              "phpunit_output": output[-12000:]
           }
-          EOF
+
+          Path("evaluation-results/result.json").write_text(json.dumps(data, indent=2))
+          PY
 
       - name: Upload result artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: evaluation-result-${{ inputs.submission_id }}
-          path: evaluation-results/result.json
+          path: |
+            evaluation-results/result.json
+            evaluation-results/phpunit-output.txt
+
+      - name: Fail workflow when hidden tests fail
+        if: steps.hidden_tests.outputs.test_exit != '0'
+        run: exit 1
